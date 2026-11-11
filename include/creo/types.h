@@ -38,6 +38,7 @@ void  putx(u64 v);
 void  kputc_raw(char c);
 void  kputs_raw(const char *s);
 int   kprintf(const char *fmt, ...);
+int   ksnprintf(char *buf, usize cap, const char *fmt, ...);
 
 /* mm */
 void  mm_init(void);
@@ -49,25 +50,26 @@ void  sched_init(void);
 void  task_create(void (*entry)(void));
 void  sched_run(void) __attribute__((noreturn));
 void  yield(void);
+void  sleep_ticks(u64 n);
+u64   jiffies(void);
 
 /* low-level plumbing */
 void *pmem_alloc_pages(u64 n);
 void *memcpy(void *d, const void *s, u64 n);
 void *memset(void *d, int c, u64 n);
-u32   gic_pending(void);
-void  gic_ack(u32 id);
 
 /* timer */
+#define HZ 100
 void  timer_init(void);
 u64   ticks(void);
 void  timer_rearm(void);
 
 /* exceptions/intc */
 void  gic_init(void);
-void  intr_enable(void);
 
 /* ui */
 void  ui_init(void);
 void  ui_paint(void);
+void  ui_puts(u64 r, u64 c, const char *s);
 
 #endif

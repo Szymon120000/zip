@@ -1,74 +1,95 @@
-/* CreoOS — tasks. The only switching mechanism: timer IRQ saves full context
- * to the current task slot, loads the next one, single eret does the jump.
- * ctx layout MUST match vectors.S (sp-relative after `sub sp, #320`):
- *   x[0..30]  gp regs,  x[31]=spsr_el1,  x[32]=elr_el1
+/* CreoOS — tasks. Round-robin, preemptive.
+ *
+ * Each task has its own stack. A task that is not running is nothing but a
+ * saved stack pointer aimed at a frame laid out by vectors.S:
+ *   [0..30] x0..x30   [31] spsr_el1   [32] elr_el1   [33] pad
+ * Switching = hand vectors.S a different frame pointer.
+ *
+ * Slot 0 is the boot context; it becomes the idle task and only runs when
+ * nothing else is runnable.
  */
 #include <creo/types.h>
 
-#define CTX_SLOTS   4
-#define TASK_STACKS 8   /* pages each */
+#define NTASK       8
+#define STACK_PAGES 8
+#define FRAME_WORDS 34
+#define SPSR_EL1H   0x5     /* EL1, own stack, interrupts enabled */
 
 struct task {
-    u64 x[33];
+    u64 *sp;
+    u64  wake;              /* runnable once jiffies() >= wake */
 };
 
-static struct task tasks[CTX_SLOTS];
-static u64 stacks[CTX_SLOTS];
+static struct task tasks[NTASK];
 static u64 ntask;
 static u64 cur;
+static volatile u64 njiffies;
 
-u64 irq_handler(u64 sp)
+u64 jiffies(void) { return njiffies; }
+
+static void task_exit(void)
 {
-    u64 *sched_pick(u64 *live);
-    u64 pending = gic_pending();
-    if ((pending & 0x3ff) == 29) { /* EL1 virtual timer On QEMU virt */
-        timer_rearm();
-        gic_ack(pending);
-        sched_pick((u64 *)sp);
-    } else {
-        gic_ack(pending);
-    }
-    return sp;
+    panic("task returned");
 }
 
 void sched_init(void)
 {
     cur = 0;
-    ntask = 1; /* slot 0 = idle/first */
+    ntask = 1;
 }
 
 void task_create(void (*entry)(void))
 {
-    u64 slot = ntask;
-    if (slot >= CTX_SLOTS)
+    if (ntask >= NTASK)
         panic("out of task slots");
+    u64 *top = (u64 *)((u8 *)pmem_alloc_pages(STACK_PAGES) + STACK_PAGES * 4096);
+    u64 *frame = top - FRAME_WORDS;
+    memset(frame, 0, FRAME_WORDS * 8);
+    frame[30] = (u64)task_exit;
+    frame[31] = SPSR_EL1H;
+    frame[32] = (u64)entry;
+    tasks[ntask].sp = frame;
+    tasks[ntask].wake = 0;
     ntask++;
-    stacks[slot] = (u64)pmem_alloc_pages(TASK_STACKS) + TASK_STACKS * 4096;
-    tasks[slot].x[32] = (u64)entry;      /* elr */
-    tasks[slot].x[31] = 0x3c5;           /* spsr: EL1h, DAIF masked */
 }
 
-u64 *sched_pick(u64 *live)
+/* Called with interrupts masked, from an exception. */
+u64 *sched_switch(u64 *frame)
 {
-    memcpy(tasks[cur].x, live, 33 * 8);
-    cur = (cur + 1) % ntask;
-    memcpy(live, tasks[cur].x, 33 * 8);
-    return live;
+    tasks[cur].sp = frame;
+    for (u64 i = 1; i <= ntask; i++) {
+        u64 n = (cur + i) % ntask;
+        if (n != 0 && tasks[n].wake <= njiffies) {
+            cur = n;
+            return tasks[n].sp;
+        }
+    }
+    cur = 0;
+    return tasks[0].sp;
 }
 
-void sched_run(void)
+u64 *sched_tick(u64 *frame)
 {
-    for (;;)
-        yield();
-}
-
-u64 *sched_switch(u64 *live)
-{
-    u64 *sched_pick(u64 *live);
-    return sched_pick(live);
+    njiffies++;
+    return sched_switch(frame);
 }
 
 void yield(void)
 {
     __asm__ volatile("svc #0");
+}
+
+void sleep_ticks(u64 n)
+{
+    intr_disable();
+    tasks[cur].wake = njiffies + n;
+    intr_enable();
+    yield();
+}
+
+void sched_run(void)
+{
+    intr_enable();
+    for (;;)
+        wfi();
 }

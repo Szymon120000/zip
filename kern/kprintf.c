@@ -18,6 +18,15 @@ int kprintf(const char *fmt, ...)
     return n;
 }
 
+int ksnprintf(char *buf, usize cap, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = kvsprintf(buf, cap, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
 int kvsprintf(char *buf, usize cap, const char *fmt, va_list ap)
 {
     char *p = buf, *end = buf + cap - 1;
@@ -61,7 +70,7 @@ int kvsprintf(char *buf, usize cap, const char *fmt, va_list ap)
             break;
         case 'd':
         case 'u': {
-            i64 sv = lx >= 2 ? va_arg(ap, i64)
+            i64 sv = lx >= 1 ? va_arg(ap, i64)
                              : (c == 'u' ? (i64)va_arg(ap, unsigned int)
                                          : (i64)va_arg(ap, int));
             char *q = &t[sizeof(t) - 1];
@@ -82,7 +91,7 @@ int kvsprintf(char *buf, usize cap, const char *fmt, va_list ap)
         case 'x':
         case 'p':
             v = (c == 'p') ? va_arg(ap, u64)
-                           : (lx >= 2 ? va_arg(ap, u64) : (u64)va_arg(ap, unsigned int));
+                           : (lx >= 1 ? va_arg(ap, u64) : (u64)va_arg(ap, unsigned int));
             if (v == 0) {
                 src = "0x0", len = 3;
                 break;

@@ -55,7 +55,7 @@ Notes for the next session (do these in order):
 
 - `qemu-system-aarch64` → must use `-kernel build/kern/creo.elf` (ELF). The `-device loader,file=...` path silently skips chunks (caused hours-long "empty vectors" mirage). NEVER debug with `loader` again.
 - Ubuntu toolchain: `gcc-aarch64-linux-gnu`, default `aarch64-none-elf` does NOT exist on this platform. Set `CROSS ?= aarch64-linux-gnu-` in Makefile.
-- QEMU virt: EL1 physical timer = INTID **30**, virtual timer = **29**; virt wires **only 29** as a PPI actually deliverable. `cntp` (physical) is NOT routed into the GIC on virt.
+- QEMU virt timer INTIDs: EL1 **virtual** timer (`cntv_*`) = **27**, EL1 physical (`cntp_*`) = **30**, **29 = SECURE physical timer** (never ours). The old "virtual = 29" note here was wrong and was the whole GIC blocker — see 2026-11-11.
 - The `aarch64-linux-gnu` default max-page-size is 64K → ELFs link at `0x40070000`, not `0x40080000`. Fixed with `-Wl,-z,max-page-size=4096`. **Keep this — QEMU assumes 0x40080000.**
 - `kprintf`'s formatted path: any format-spec expansion may hang if it writes >UART-FIFO capacity — keep the non-blocking TXFF char writer. (Root-caused: PL011 would fill.)
 - Login toolchain quirk: `sudo` needs `echo root | sudo -S`; `pkill -f` patterns must not self-match (use `qemu-system[a]` bracket trick).
@@ -235,3 +235,35 @@ CreoOS/
 - Kernel state: SVC-swap RR scheduler stable, CreoUI paints, fb-probe painted color
   wheel in QEMU build; kernel 17472 bytes at 0x10008000, verified boot.img v1 layout.
 - Wifi/next-bringup (GICv3, DPU) remain queued; waiting for device access to resolve.
+
+## 2026-11-11 — QEMU core made real: timer IRQ delivered, true preemption, per-task stacks
+Verified in QEMU 11.0.0 (`-M virt -cpu cortex-a57`, both `virtualization=off` and `=on`),
+built with `make LLVM=1` (clang 15 + lld). The gcc path (`make`) is unchanged in intent but
+was NOT rebuilt this session.
+
+Root causes found (each one was hiding the next):
+- **GIC "blocker" = wrong INTID.** We armed the virtual timer (`cntv`, INTID 27) but enabled
+  INTID 29 (secure physical timer). IAR=1023 was honest. Now: enable 27, `GICD_CTLR=1`,
+  `GICC_CTLR=1`, `PMR=0xff`, no IGROUPR games.
+- **Vector table was mis-ordered and 14 entries long.** Layout is 4 groups x (Sync, IRQ, FIQ,
+  SError). `el1_irq` sat in the *sync* slot of current-EL-SPx, so `svc` landed in the IRQ
+  handler and fell through into the SVC path. The "SVC-swap works" result was that accident.
+- **All tasks shared one stack** (`stacks[]` was allocated but never used; the switch memcpy'd
+  33 regs over the same frame). Now each task has its own stack and a task is just a saved sp.
+- **Alignment faults with MMU off** (RAM is Device memory): added `-mstrict-align`.
+- `kprintf("%lx")` read 32 bits; `sync_trap` printed uninitialised elr/far/spsr.
+- `make run` pointed at a non-existent ELF and used `-device loader`; now `-kernel build/kern/creo.elf`.
+
+Added: EL2 -> EL1 drop in `entry.S` (DTB pointer preserved into `kmain(dtb)`), `sleep_ticks()`,
+`jiffies()`, idle task that only runs when nothing is runnable, `ksnprintf`, HZ=100.
+Proof of preemption: `task02` spins forever without yielding while `task01` wakes once a
+second and reports task02's counter climbing.
+
+Phone build (`make LLVM=1 phone`) still links and packs `build/phone/boot.img`, and now gets
+`-mstrict-align` plus the EL2 drop. NOT tested on hardware. Open doubts for the device:
+- `tgt-exynos.c` mixes PL011 offsets (FR @0x18) with Samsung UART registers; Exynos UART is
+  not PL011 (UTRSTAT @0x10, UTXH @0x20). The banner cannot print as written.
+- `tgt-fbprobe.c` writes 15 MB blocks to guessed DRAM addresses; one of them may be ours.
+- The raw kernel has no arm64 `Image` header and no DTB; unknown whether sboot cares.
+
+Next (QEMU, no phone needed): UART RX + serial shell, virtio-gpu scanout, MMU on, EL0.

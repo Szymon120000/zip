@@ -1,16 +1,29 @@
 # CreoOS — NO BLOAT makefile
+#   make            GNU cross toolchain (aarch64-linux-gnu-)
+#   make LLVM=1     clang + lld + llvm-objcopy (no cross gcc needed)
 ARCH      := aarch64
 CROSS     ?= aarch64-linux-gnu-
+
+ifdef LLVM
+CC        := clang --target=aarch64-none-elf
+OBJCOPY   := llvm-objcopy
+LDDRIVER  := -fuse-ld=lld
+else
 CC        := $(CROSS)gcc
+OBJCOPY   := $(CROSS)objcopy
+LDDRIVER  :=
+endif
 
 # QEMU boot target first; beyond2lte board target comes after bring-up
 DEFINES   := -DQEMU
+# -mstrict-align: with the MMU off all RAM is Device memory, where an
+# unaligned access is an alignment fault.
 CFLAGS    := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
-             -fno-omit-frame-pointer -mgeneral-regs-only -Wall -Wextra \
+             -fno-omit-frame-pointer -mgeneral-regs-only -mstrict-align -Wall -Wextra \
              -O2 -g -Iinclude $(DEFINES)
 ASFLAGS   := $(CFLAGS)
-LDFLAGS   := -nostdlib -nostartfiles -T linker.ld -Wl,-z,max-page-size=4096 -Wl,--build-id=none \
-             -Wl,-Map,build/creo.map
+LDCOMMON  := $(LDDRIVER) -nostdlib -Wl,-z,max-page-size=4096 -Wl,--build-id=none
+LDFLAGS   := $(LDCOMMON) -T linker.ld -Wl,-Map,build/creo.map
 
 SRCS      := kern/entry.S kern/vectors.S kern/uart.c kern/kprintf.c \
              kern/mm.c kern/timer.c kern/sched.c kern/main.c kern/util.c \
@@ -18,19 +31,22 @@ SRCS      := kern/entry.S kern/vectors.S kern/uart.c kern/kprintf.c \
 OBJS      := $(patsubst %.c,build/%.o,$(SRCS))
 OBJS      := $(OBJS:.S=.o)
 
+QEMU      := qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic -smp 1 -m 1024M \
+             -kernel build/kern/creo.elf
+
 all: image
 
 build:
 	@mkdir -p build/kern build/ui build/user
 
 image: build/kern/creo.elf
-	$(CROSS)objcopy -O binary build/kern/creo.elf build/creo.img
+	$(OBJCOPY) -O binary build/kern/creo.elf build/creo.img
 	@echo "==> build/creo.img  [NO BLOAT]"
 
-build/kern/creo.elf: $(OBJS)
+build/kern/creo.elf: $(OBJS) linker.ld
 	$(CC) $(filter %.o,$^) -o $@ $(LDFLAGS)
 
-build/%.o: %.c | build
+build/%.o: %.c include/creo/types.h | build
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -44,31 +60,29 @@ PHONE_OBJS := $(subst build/,build/phone-objs/,$(OBJS)) \
               build/phone-objs/kern/tgt-exynos.o build/phone-objs/kern/tgt-fbprobe.o
 PHONE_CFLAGS := $(CFLAGS) -DCREO_PHONE
 
-build/phone-objs/%.o: %.c | build
+build/phone-objs/%.o: %.c include/creo/types.h | build
 	@mkdir -p $(dir $@)
 	$(CC) $(PHONE_CFLAGS) -c $< -o $@
 
-$(subst .c,.o,$(PHONE_SOURCES)) build/phone/creo-phone-ua: ;
+build/phone-objs/%.o: %.S | build
+	@mkdir -p $(dir $@)
+	$(CC) $(PHONE_CFLAGS) -c $< -o $@
 
-build/phone/creo-phone.elf: $(PHONE_OBJS)
+build/phone/creo-phone.elf: $(PHONE_OBJS) linker-phone.ld
 	@mkdir -p build/phone
-	$(CC) $(PHONE_OBJS) -o $@ -nostdlib -nostartfiles \
-	  -T linker-phone.ld -Wl,-z,max-page-size=4096 -Wl,--build-id=none
+	$(CC) $(PHONE_OBJS) -o $@ $(LDCOMMON) -T linker-phone.ld
 
 build/phone/boot.img: build/phone/creo-phone.elf
-	$(CROSS)objcopy -O binary build/phone/creo-phone.elf build/phone/creo-phone.bin
+	$(OBJCOPY) -O binary build/phone/creo-phone.elf build/phone/creo-phone.bin
 	python3 scripts/mkbootimg.py --kernel build/phone/creo-phone.bin \
 	  --cmdline "creo" --out build/phone/boot.img
 
+# Always boot the ELF with -kernel; `-device loader` silently drops chunks.
 run: image
-	qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic \
-	  -device loader,file=build/creo.elf,addr=0x40080000,cpu-num=0 \
-	  -smp 1 -m 1024M
+	$(QEMU)
 
 run-gdb: image
-	qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic \
-	  -device loader,file=build/creo.elf,addr=0x40080000,cpu-num=0 \
-	  -smp 1 -m 1024M -gdb tcp::1234 -S
+	$(QEMU) -gdb tcp::1234 -S
 
 clean:
 	rm -rf build
